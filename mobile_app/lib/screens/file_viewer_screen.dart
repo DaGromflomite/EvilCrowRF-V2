@@ -35,6 +35,7 @@ class _FileViewerScreenState extends State<FileViewerScreen>
     with TickerProviderStateMixin {
   String? fileContent;
   bool isLoading = false;
+  bool _previewRequested = false; // opt-in preview gate
   String? errorMessage;
   bool isDownloading = false;
   double downloadProgress = 0.0;
@@ -56,10 +57,10 @@ class _FileViewerScreenState extends State<FileViewerScreen>
     // Initial tab count (Raw always present)
     _tabController = TabController(length: 1, vsync: this);
     
-    // Defer file loading until build completes
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-    _loadFileContent();
-    });
+    // NOTE: do NOT auto-read the file over BLE here. Reading content back
+    // from the SD is slow and can time out / hit "file too large" on big
+    // files, and it's not needed to transmit (the Crow plays straight off
+    // its SD). Preview is now opt-in via a button in the body.
   }
 
   @override
@@ -70,8 +71,9 @@ class _FileViewerScreenState extends State<FileViewerScreen>
 
   Future<void> _loadFileContent() async {
     if (!mounted) return;
-    
+
     setState(() {
+      _previewRequested = true;
       isLoading = true;
       errorMessage = null;
       fileContent = null;
@@ -946,6 +948,46 @@ class _FileViewerScreenState extends State<FileViewerScreen>
                     ),
                   ),
                 ],
+              ),
+            );
+          }
+
+          // Opt-in preview: don't read over BLE until the user asks.
+          if (fileContent == null && errorMessage == null && !_previewRequested) {
+            return Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    const Icon(Icons.description_outlined,
+                        size: 56, color: AppColors.secondaryText),
+                    const SizedBox(height: 12),
+                    Text(
+                      widget.fileItem.name,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        color: AppColors.primaryText,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 15,
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    const Text(
+                      'Preview reads the file back over BLE, which is slow and '
+                      'can time out on large files. You don\'t need to preview '
+                      'it to transmit — the Crow plays it straight off its SD.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: AppColors.secondaryText, fontSize: 12),
+                    ),
+                    const SizedBox(height: 20),
+                    ElevatedButton.icon(
+                      onPressed: _loadFileContent,
+                      icon: const Icon(Icons.visibility, size: 18),
+                      label: const Text('Load preview'),
+                    ),
+                  ],
+                ),
               ),
             );
           }

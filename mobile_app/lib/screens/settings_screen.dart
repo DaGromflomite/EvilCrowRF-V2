@@ -3337,6 +3337,11 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
   bool _hasError = false;
   String _errorMessage = '';
 
+  // ETA tracking for the upload phase
+  DateTime? _uploadStartTime;
+  int _uploadStartCount = 0;
+  String _etaText = '';
+
   // Pause / Resume state
   bool _isPaused = false;
   bool _pauseRequested = false;
@@ -3571,6 +3576,11 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
       _totalFiles = files.length;
       _uploadedFiles = _completedPaths.length;
 
+      // Start ETA clock from this run's starting point (supports resume)
+      _uploadStartTime = DateTime.now();
+      _uploadStartCount = _completedPaths.length;
+      _etaText = '';
+
       // Phase 3: Create base directory on SDCard
       setState(() {
         _phase = 'upload';
@@ -3643,6 +3653,7 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
             _statusText =
                 'Uploading (${_uploadedFiles + 1}/$_totalFiles): ${file.relativePath}';
             _progress = _totalFiles > 0 ? _uploadedFiles / _totalFiles : 0.0;
+            _etaText = _computeEta();
           });
         }
 
@@ -3660,8 +3671,9 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
             await FlipperSubDbService.saveProgress(_completedPaths);
           }
 
-          // Pace uploads to avoid BLE congestion
-          await Future.delayed(const Duration(milliseconds: 150));
+          // Small breather between files (down from 150ms). Per-chunk
+          // write-with-response already provides flow control.
+          await Future.delayed(const Duration(milliseconds: 20));
         } catch (e) {
           _failedFiles++;
           // Log but continue with other files
@@ -3700,6 +3712,31 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
         });
       }
     }
+  }
+
+  /// Estimate time remaining for the upload based on the average time per
+  /// file measured so far this run. Returns '' when there is nothing to show.
+  String _computeEta() {
+    final start = _uploadStartTime;
+    if (start == null) return '';
+    final doneThisRun = _uploadedFiles - _uploadStartCount;
+    final remaining = _totalFiles - _uploadedFiles;
+    if (remaining <= 0) return '';
+    if (doneThisRun < 1) return 'Estimating time remaining…';
+    final elapsedMs = DateTime.now().difference(start).inMilliseconds;
+    if (elapsedMs <= 0) return '';
+    final perFileMs = elapsedMs / doneThisRun;
+    final etaMs = (perFileMs * remaining).round();
+    return '~${_formatDuration(Duration(milliseconds: etaMs))} remaining';
+  }
+
+  String _formatDuration(Duration d) {
+    if (d.inHours >= 1) {
+      return '${d.inHours}h ${d.inMinutes.remainder(60)}m';
+    } else if (d.inMinutes >= 1) {
+      return '${d.inMinutes}m ${d.inSeconds.remainder(60)}s';
+    }
+    return '${d.inSeconds}s';
   }
 
   Widget _introStep(String n, String text) {
@@ -4103,6 +4140,20 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
               style: TextStyle(
                 color: AppColors.secondaryText,
                 fontSize: 11,
+              ),
+            ),
+
+          // Live time-remaining estimate (during active upload only)
+          if (_phase == 'upload' && !_isDone && !_isPaused && _etaText.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                _etaText,
+                style: TextStyle(
+                  color: AppColors.secondaryText,
+                  fontSize: 11,
+                  fontStyle: FontStyle.italic,
+                ),
               ),
             ),
 

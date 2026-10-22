@@ -4,7 +4,6 @@ import 'dart:typed_data';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/file_item.dart';
@@ -576,7 +575,18 @@ class BleProvider extends ChangeNotifier {
            print('MTU negotiation failed: $e');
            _log('warning', 'MTU negotiation failed', details: 'Error: $e');
          }
-         
+
+         // Request a high-priority connection (Android: shorter connection
+         // interval => more packets per cycle => faster chunked uploads).
+         // No-op on platforms that don't support it.
+         try {
+           await device.requestConnectionPriority(
+               connectionPriorityRequest: ConnectionPriority.high);
+           _log('info', 'Requested high connection priority');
+         } catch (e) {
+           _log('warning', 'Connection priority request failed', details: 'Error: $e');
+         }
+
          _rxValueSubscription?.cancel();
          _rxValueSubscription = rxCharacteristic!.onValueReceived.listen((value) {
             _log('debug', 'Received data', details: 'Length: ${value.length} bytes');
@@ -2047,7 +2057,13 @@ class BleProvider extends ChangeNotifier {
     } else if (data is String) {
       errorMessage = data;
     }
-    
+
+    // During repeat-transmit the firmware emits spurious "command not
+    // supported" errors between bursts — don't let them clobber the status.
+    if (_suppressTxNotify) {
+      return;
+    }
+
     statusMessage = 'Error: $errorMessage';
     notifyListeners();
   }
@@ -2216,27 +2232,53 @@ class BleProvider extends ChangeNotifier {
   void _handleSignalSentResponse(dynamic data) {
     print('Signal sent: $data');
     _log('info', 'Signal sent', details: data.toString());
-    _notify('success', 'Signal transmitted');
+    _completeTxBurst(); // let a hold/repeat loop know this burst finished
+    if (!_suppressTxNotify) _notify('success', 'Signal transmitted');
     notifyListeners();
   }
 
   /// Handle signal sending error response
   void _handleSignalSendingErrorResponse(dynamic data) {
-    print('Signal sending error: $data');
     String errorMessage = 'Transmission failed';
-    if (data is Map<String, dynamic> && data.containsKey('data')) {
-      final errorData = data['data'];
-      if (errorData is Map<String, dynamic>) {
-        errorMessage = errorData['error']?.toString() ?? 'Transmission failed';
-        if (errorData.containsKey('filename')) {
-          errorMessage += ': ${errorData['filename']}';
-        }
+    int? errorCode;
+    int? module;
+    if (data is Map<String, dynamic> && data['data'] is Map<String, dynamic>) {
+      final errorData = data['data'] as Map<String, dynamic>;
+      errorMessage = errorData['error']?.toString() ?? 'Transmission failed';
+      if (errorData.containsKey('filename')) {
+        errorMessage += ': ${errorData['filename']}';
       }
+      errorCode = (errorData['errorCode'] is int)
+          ? errorData['errorCode'] as int
+          : int.tryParse('${errorData['errorCode']}');
+      module = (errorData['module'] is int)
+          ? errorData['module'] as int
+          : int.tryParse('${errorData['module']}');
     }
+
+    // Drop spurious/benign noise the firmware emits during repeat-transmit:
+    // errorCode 0 means "no real error", and only modules 0/1 exist so a
+    // higher index is bogus. These shouldn't pollute the UI/logs or unblock
+    // the repeat loop (the real SignalSent does that).
+    final bool benign = errorCode == 0 || (module != null && module > 1);
+    if (benign) {
+      return;
+    }
+
+    print('Signal sending error: $data');
     statusMessage = errorMessage;
     _log('error', 'Signal sending error', details: errorMessage);
-    _notify('error', errorMessage);
+    _completeTxBurst(); // unblock the repeat loop on a real error
+    if (!_suppressTxNotify) _notify('error', errorMessage);
     notifyListeners();
+  }
+
+  // Completes when the current transmit burst finishes (SignalSent/Error).
+  Completer<void>? _txBurstCompleter;
+  void _completeTxBurst() {
+    if (_txBurstCompleter != null && !_txBurstCompleter!.isCompleted) {
+      _txBurstCompleter!.complete();
+    }
   }
 
   /// Handle mode switch response
@@ -2654,13 +2696,27 @@ class BleProvider extends ChangeNotifier {
     }
 
     _log('INFO', 'Uploading file: ${file.path} to $targetPath');
+    final fileSize = await file.length();
+    // Stream straight from disk so large files never load fully into memory.
+    return _uploadFromStream(file.openRead(), fileSize, targetPath,
+        pathType: pathType, onProgress: onProgress);
+  }
+
+  /// Shared upload core: chunk a byte stream of known [fileSize] to the device
+  /// at [targetPath]. Fed by a File stream (uploadFile) or an in-memory buffer
+  /// (uploadFileFromBytes) — the latter needs NO scratch temp file.
+  Future<Map<String, dynamic>> _uploadFromStream(
+    Stream<List<int>> dataStream,
+    int fileSize,
+    String targetPath, {
+    int pathType = 0,
+    Function(double progress)? onProgress,
+  }) async {
     _isUploading = true;
     _uploadProgress = 0.0;
     notifyListeners();
 
     try {
-      // Read file size
-      final fileSize = await file.length();
       _log('INFO', 'File size: $fileSize bytes');
 
       // Calculate number of chunks
@@ -2669,15 +2725,20 @@ class BleProvider extends ChangeNotifier {
       // Payload size = MAX_CHUNK_SIZE - PACKET_HEADER_SIZE - checksum(1)
       const int maxChunkDataSize = FirmwareBinaryProtocol.MAX_CHUNK_SIZE - FirmwareBinaryProtocol.PACKET_HEADER_SIZE - 1;
       final int totalChunks = 1 + ((fileSize + maxChunkDataSize - 1) ~/ maxChunkDataSize);
-      
+
       _log('INFO', 'Total chunks: $totalChunks');
 
       // Generate chunk ID
       final int chunkId = DateTime.now().millisecondsSinceEpoch & 0xFF;
 
-      // Create completer for upload response
+      // Create completer for upload response.
+      // Keep a LOCAL reference: the firmware can reply so fast that
+      // _handleFileUploadResponse completes AND nulls _pendingUploadCompleter
+      // before we reach the await below. Awaiting the local avoids a
+      // "Null check operator used on a null value" race on fast uploads.
       _pendingUploadCompleter?.completeError('New upload started');
-      _pendingUploadCompleter = Completer<Map<String, dynamic>>();
+      final uploadCompleter = Completer<Map<String, dynamic>>();
+      _pendingUploadCompleter = uploadCompleter;
 
       // Send first chunk with path
       final firstChunk = FirmwareBinaryProtocol.createUploadFileStartCommand(
@@ -2692,11 +2753,10 @@ class BleProvider extends ChangeNotifier {
       notifyListeners();
 
       // Read and send file data in chunks
-      final fileStream = file.openRead();
       int chunkNum = 2; // Start from chunk 2 (chunk 1 is the path)
       int totalSent = 0;
 
-      await for (final chunk in fileStream) {
+      await for (final chunk in dataStream) {
         // Split chunk if it's too large
         int offset = 0;
         while (offset < chunk.length) {
@@ -2723,9 +2783,10 @@ class BleProvider extends ChangeNotifier {
           _uploadProgress = totalSent / fileSize;
           onProgress?.call(_uploadProgress);
           notifyListeners();
-          
-          // Small delay to avoid overwhelming BLE stack
-          await Future.delayed(const Duration(milliseconds: 10));
+
+          // No artificial delay: sendBinaryCommand uses write-WITH-response,
+          // so each chunk already waits for the BLE stack to ack before the
+          // next — that is the flow control. An extra sleep was pure overhead.
         }
       }
 
@@ -2733,14 +2794,16 @@ class BleProvider extends ChangeNotifier {
 
       // Wait for upload response with timeout
       final timeout = Timer(const Duration(seconds: 30), () {
-        if (_pendingUploadCompleter != null && !_pendingUploadCompleter!.isCompleted) {
-          _pendingUploadCompleter!.completeError('Upload timeout');
+        if (!uploadCompleter.isCompleted) {
+          uploadCompleter.completeError('Upload timeout');
+        }
+        if (identical(_pendingUploadCompleter, uploadCompleter)) {
           _pendingUploadCompleter = null;
         }
       });
 
       try {
-        final response = await _pendingUploadCompleter!.future;
+        final response = await uploadCompleter.future;
         timeout.cancel();
         _uploadProgress = 1.0;
         onProgress?.call(1.0);
@@ -2754,7 +2817,10 @@ class BleProvider extends ChangeNotifier {
         notifyListeners();
         rethrow;
       } finally {
-        _pendingUploadCompleter = null;
+        // Only clear if it is still ours (a later upload may have replaced it)
+        if (identical(_pendingUploadCompleter, uploadCompleter)) {
+          _pendingUploadCompleter = null;
+        }
       }
     } catch (e) {
       _isUploading = false;
@@ -2766,22 +2832,20 @@ class BleProvider extends ChangeNotifier {
   }
 
   /// Upload raw bytes as a file to the device SDCard.
-  /// Writes to a temp file first, then uploads via the standard pipeline.
+  /// Streams straight from the in-memory buffer — no scratch temp file, no
+  /// redundant disk write/read (the bytes are already in memory from the
+  /// phone-side download/extract).
   Future<Map<String, dynamic>> uploadFileFromBytes(
     Uint8List bytes,
     String targetPath, {
     int pathType = 5,
     Function(double progress)? onProgress,
   }) async {
-    final tempDir = await getTemporaryDirectory();
-    final tempFile = File('${tempDir.path}/_upload_tmp_${DateTime.now().millisecondsSinceEpoch}');
-    try {
-      await tempFile.writeAsBytes(bytes);
-      return await uploadFile(tempFile, targetPath,
-          pathType: pathType, onProgress: onProgress);
-    } finally {
-      try { await tempFile.delete(); } catch (_) {}
+    if (!isConnected) {
+      throw Exception('Device not connected');
     }
+    return _uploadFromStream(Stream<List<int>>.value(bytes), bytes.length, targetPath,
+        pathType: pathType, onProgress: onProgress);
   }
 
   // Scanner state management methods
@@ -2936,7 +3000,7 @@ class BleProvider extends ChangeNotifier {
   /// Send binary command via Enhanced Protocol
   /// [command] - binary command to send
   // Transmit signal from file
-  Future<void> transmitFromFile(String filePath, {int? module, int repeat = 1, int? pathType}) async {
+  Future<void> transmitFromFile(String filePath, {int? module, int repeat = 1, int? pathType, bool force = false}) async {
     if (!isConnected || txCharacteristic == null) {
       statusMessage = 'Not connected';
       _log('error', 'Failed to transmit: Not connected', details: 'File: $filePath');
@@ -2947,7 +3011,11 @@ class BleProvider extends ChangeNotifier {
     try {
       // Find idle module if not specified
       int? selectedModule = module;
-      if (selectedModule == null) {
+      if (force) {
+        // Caller owns module selection/pacing (e.g. hold/repeat loop) — skip
+        // the cached idle check, which can be stale and block legit re-sends.
+        selectedModule ??= 0;
+      } else if (selectedModule == null) {
         // Find first idle module
         if (cc1101Modules != null) {
           for (int i = 0; i < cc1101Modules!.length; i++) {
@@ -2958,7 +3026,7 @@ class BleProvider extends ChangeNotifier {
             }
           }
         }
-        
+
         // If no idle module found, throw error
         if (selectedModule == null) {
           statusMessage = 'No idle module available';
@@ -3015,6 +3083,56 @@ class BleProvider extends ChangeNotifier {
       notifyListeners();
       rethrow;
     }
+  }
+
+  // --- Hold-to-repeat transmission ------------------------------------------
+  // Flipper-style: while the user holds the transmit button, re-fire the same
+  // file back-to-back until they release. Each pass waits for the module to be
+  // free again (transmitFromFile throws if it is still Transmitting), so this
+  // self-paces to the hardware instead of overlapping bursts.
+  bool _repeatTx = false;
+  bool _suppressTxNotify = false;
+  bool get isRepeatTransmitting => _repeatTx;
+
+  Future<void> startRepeatTransmit(String filePath,
+      {int? module, int? pathType}) async {
+    if (_repeatTx) return; // already looping
+    _repeatTx = true;
+    _suppressTxNotify = true; // don't spam a toast per burst
+    notifyListeners();
+
+    final useModule = module ?? 0; // pin ONE module — never let it contend
+
+    while (_repeatTx && isConnected) {
+      try {
+        // Fire one burst and wait for the firmware to report it finished
+        // (SignalSent/SignalSendingError) before the next — this gating is
+        // what prevents bursts from stacking up, so no pre-idle is needed.
+        // The timeout only bounds the wait if no event comes back.
+        _txBurstCompleter = Completer<void>();
+        await transmitFromFile(filePath,
+            module: useModule, pathType: pathType, force: true);
+        await _txBurstCompleter!.future
+            .timeout(const Duration(milliseconds: 800), onTimeout: () {});
+      } catch (_) {
+        // Transient failure — pause briefly, then the loop retries.
+        await Future.delayed(const Duration(milliseconds: 100));
+      }
+      // Brief gap between repeats.
+      await Future.delayed(const Duration(milliseconds: 40));
+    }
+  }
+
+  void stopRepeatTransmit() {
+    if (!_repeatTx && !_suppressTxNotify) return;
+    _repeatTx = false;
+    _suppressTxNotify = false;
+    _completeTxBurst();
+    // Leave the pinned module idle when we stop.
+    try {
+      sendIdleCommand(0);
+    } catch (_) {}
+    notifyListeners();
   }
 
   Future<void> sendBinaryCommand(Uint8List command, {bool withoutResponse = false}) async {

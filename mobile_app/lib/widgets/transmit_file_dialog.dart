@@ -64,10 +64,20 @@ class TransmitFileDialog {
       }
     }
     
-    // Show confirmation dialog
+    // Show confirmation dialog with a large tap/hold transmit button.
     bool dontShowAgain = false;
-    final confirmed = await showDialog<bool>(
+    bool transmitting = false;
+
+    Future<void> savePref() async {
+      if (dontShowAgain) {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setBool(_dontShowAgainKey, true);
+      }
+    }
+
+    final result = await showDialog<bool>(
       context: context,
+      barrierDismissible: false,
       builder: (context) {
         return StatefulBuilder(
           builder: (context, setState) {
@@ -125,6 +135,66 @@ class TransmitFileDialog {
                     ),
                   ),
                   const SizedBox(height: 16),
+                  // Large, finger-friendly transmit toggle: tap once to start
+                  // transmitting continuously, tap again to stop. Clearer than
+                  // press-and-hold on a touchscreen (no accidental release).
+                  GestureDetector(
+                    onTap: () async {
+                      if (transmitting) {
+                        // Stop
+                        bleProvider.stopRepeatTransmit();
+                        setState(() => transmitting = false);
+                      } else {
+                        // Start continuous transmission
+                        await savePref();
+                        setState(() => transmitting = true);
+                        bleProvider.startRepeatTransmit(filePath,
+                            pathType: pathType);
+                        if (context.mounted) {
+                          Provider.of<NotificationProvider>(context,
+                                  listen: false)
+                              .showSuccess(AppLocalizations.of(context)!
+                                  .signalTransmissionStarted(fileName));
+                        }
+                      }
+                    },
+                    child: Container(
+                      height: 72,
+                      width: double.infinity,
+                      decoration: BoxDecoration(
+                        color: transmitting
+                            ? AppColors.error
+                            : AppColors.warning,
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(
+                              transmitting
+                                  ? Icons.stop_circle
+                                  : Icons.send,
+                              color: AppColors.primaryBackground,
+                              size: 28),
+                          const SizedBox(width: 10),
+                          Flexible(
+                            child: Text(
+                              transmitting
+                                  ? '● TRANSMITTING — TAP TO STOP'
+                                  : 'TAP TO TRANSMIT',
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(
+                                color: AppColors.primaryBackground,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 16,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
                   CheckboxListTile(
                     value: dontShowAgain,
                     onChanged: (value) {
@@ -144,17 +214,11 @@ class TransmitFileDialog {
               ),
               actions: [
                 TextButton(
-                  onPressed: () => Navigator.of(context).pop(false),
+                  onPressed: () {
+                    bleProvider.stopRepeatTransmit();
+                    Navigator.of(context).pop(false);
+                  },
                   child: Text(AppLocalizations.of(context)!.cancel),
-                ),
-                ElevatedButton.icon(
-                  onPressed: () => Navigator.of(context).pop(true),
-                  icon: const Icon(Icons.send, color: AppColors.primaryBackground),
-                  label: Text(AppLocalizations.of(context)!.transmit),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: AppColors.warning,
-                    foregroundColor: AppColors.primaryBackground,
-                  ),
                 ),
               ],
             );
@@ -162,31 +226,10 @@ class TransmitFileDialog {
         );
       },
     );
-    
-    if (confirmed != true) return false;
-    
-    // Save the "don't show again" setting
-    if (dontShowAgain) {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setBool(_dontShowAgainKey, true);
-    }
-    
-    try {
-      // Use full file path with directory
-      await bleProvider.transmitFromFile(filePath, pathType: pathType);
-      
-      if (context.mounted) {
-        final notificationProvider = Provider.of<NotificationProvider>(context, listen: false);
-        notificationProvider.showSuccess(AppLocalizations.of(context)!.signalTransmissionStarted(fileName));
-      }
-      return true;
-    } catch (e) {
-      if (context.mounted) {
-        final notificationProvider = Provider.of<NotificationProvider>(context, listen: false);
-        notificationProvider.showError(AppLocalizations.of(context)!.transmissionError(e.toString()));
-      }
-      return false;
-    }
+
+    // Safety: ensure repeat is stopped if the dialog closed unexpectedly.
+    bleProvider.stopRepeatTransmit();
+    return result == true;
   }
 }
 

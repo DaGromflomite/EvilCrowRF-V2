@@ -20,6 +20,11 @@ class BruterProtocol {
   /// Ratio of long pulse to short pulse (e.g. 3 means 1:3)
   final int ratio;
 
+  /// Alternate carrier frequencies this protocol ships on in different
+  /// regions/variants (e.g. Honeywell EU 433.92 / US 345). When non-null the
+  /// UI shows a frequency picker; the first entry should equal [frequencyMhz].
+  final List<double>? freqOptions;
+
   const BruterProtocol({
     required this.menuId,
     required this.name,
@@ -30,6 +35,7 @@ class BruterProtocol {
     required this.icon,
     this.te = 300,
     this.ratio = 3,
+    this.freqOptions,
   });
 
   /// Whether this protocol uses De Bruijn mode (menu 35-40)
@@ -116,9 +122,9 @@ const List<BruterProtocol> bruterProtocols = [
   BruterProtocol(menuId: 19, name: 'Doitrand', category: 'EU Garage', frequencyMhz: 433.92, bits: 12, encoding: 'binary', icon: Icons.garage, te: 400, ratio: 2),
 
   // US Garage Remotes
-  BruterProtocol(menuId: 4, name: 'Chamberlain', category: 'US Garage', frequencyMhz: 315.0, bits: 12, encoding: 'binary', icon: Icons.door_sliding, te: 430, ratio: 2),
+  BruterProtocol(menuId: 4, name: 'Chamberlain', category: 'US Garage', frequencyMhz: 315.0, bits: 12, encoding: 'binary', icon: Icons.door_sliding, te: 430, ratio: 2, freqOptions: [315.0, 390.0]),
   BruterProtocol(menuId: 5, name: 'Linear', category: 'US Garage', frequencyMhz: 300.0, bits: 10, encoding: 'binary', icon: Icons.door_sliding, te: 500, ratio: 3),
-  BruterProtocol(menuId: 7, name: 'LiftMaster', category: 'US Garage', frequencyMhz: 315.0, bits: 12, encoding: 'binary', icon: Icons.door_sliding, te: 400, ratio: 2),
+  BruterProtocol(menuId: 7, name: 'LiftMaster', category: 'US Garage', frequencyMhz: 315.0, bits: 12, encoding: 'binary', icon: Icons.door_sliding, te: 400, ratio: 2, freqOptions: [315.0, 390.0]),
   BruterProtocol(menuId: 23, name: 'Firefly', category: 'US Garage', frequencyMhz: 300.0, bits: 10, encoding: 'binary', icon: Icons.door_sliding, te: 400, ratio: 2),
   BruterProtocol(menuId: 24, name: 'Linear MegaCode', category: 'US Garage', frequencyMhz: 318.0, bits: 24, encoding: 'binary', icon: Icons.door_sliding, te: 500, ratio: 2),
 
@@ -129,7 +135,7 @@ const List<BruterProtocol> bruterProtocols = [
 
   // Alarm / Sensors
   BruterProtocol(menuId: 9, name: 'EV1527', category: 'Alarm', frequencyMhz: 433.92, bits: 12, encoding: 'binary', icon: Icons.security, te: 320, ratio: 3),
-  BruterProtocol(menuId: 10, name: 'Honeywell', category: 'Alarm', frequencyMhz: 433.92, bits: 12, encoding: 'binary', icon: Icons.security, te: 300, ratio: 2),
+  BruterProtocol(menuId: 10, name: 'Honeywell', category: 'Alarm', frequencyMhz: 433.92, bits: 12, encoding: 'binary', icon: Icons.security, te: 300, ratio: 2, freqOptions: [433.92, 345.0]),
   BruterProtocol(menuId: 29, name: 'EV1527 24b', category: 'Alarm', frequencyMhz: 433.92, bits: 24, encoding: 'binary', icon: Icons.security, te: 320, ratio: 3),
 
   // 868 MHz
@@ -741,90 +747,166 @@ class _BruteScreenState extends State<BruteScreen> {
     final settingsProvider = Provider.of<SettingsProvider>(context, listen: false);
     final delayMs = settingsProvider.bruterDelayMs;
 
-    // Determine if we should use custom De Bruijn (per-protocol timing/freq)
-    // instead of hardcoded De Bruijn menus which have fixed frequencies.
-    bool useCustomDeBruijn = false;
-    int actualMenuId = protocol.menuId;
-    String modeSuffix = '';
-    if (_useDeBruijnMode && !protocol.isDeBruijn && protocol.deBruijnCompatible) {
-      useCustomDeBruijn = true;
-      modeSuffix = ' (DeBruijn)';
-    }
-
     final estTime = protocol.estimatedTimeWithDelay(delayMs);
 
-    // Show confirmation dialog with protocol details
+    // Per-run selections (region frequency + timing override). Custom routing
+    // (sendCustomDeBruijnCommand) can honor any freq/te, but only for
+    // De Bruijn-compatible protocols (binary, <=16 bits).
+    final bool canCustom = protocol.deBruijnCompatible;
+    double selectedFreq = protocol.frequencyMhz;
+    int selectedTe = protocol.te;
+
+    // Candidate te values for the manual "sweep" selector: the protocol's own
+    // value plus common alternatives (resistor-set chips vary unit to unit).
+    final List<int> teOptions = (<int>{
+      protocol.te, 200, 250, 300, 350, 400, 450, 500, 550, 700
+    }.toList()
+      ..sort());
+
+    String freqLabel(double f) => f == f.roundToDouble()
+        ? '${f.toStringAsFixed(0)} MHz'
+        : '${f.toStringAsFixed(2)} MHz';
+
     final confirmed = await showDialog<bool>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text(AppLocalizations.of(context)!.startBruteForceSuffix(modeSuffix)),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            _infoRow(AppLocalizations.of(context)!.protocol, '${protocol.name}$modeSuffix'),
-            _infoRow(AppLocalizations.of(context)!.frequency, protocol.frequencyLabel),
-            _infoRow(AppLocalizations.of(context)!.keySpace, '${protocol.bits}-bit ${protocol.encoding}'),
-            if (modeSuffix.isNotEmpty)
-              _infoRow(AppLocalizations.of(context)!.modeLabel, AppLocalizations.of(context)!.deBruijnFaster),
-            _infoRow(AppLocalizations.of(context)!.delay, '$delayMs ms'),
-            _infoRow(AppLocalizations.of(context)!.estTime, estTime),
-            const SizedBox(height: 12),
-            if (protocol.bits >= 24)
-              Container(
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: AppColors.warning.withValues(alpha: 0.1),
-                  borderRadius: BorderRadius.circular(6),
-                  border: Border.all(color: AppColors.warning.withValues(alpha: 0.3)),
-                ),
-                child: Row(
-                  children: [
-                    Icon(Icons.warning_amber, color: AppColors.warning, size: 18),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        AppLocalizations.of(context)!.largeKeyspaceWarning(protocol.bits, estTime),
-                        style: TextStyle(color: AppColors.warning, fontSize: 12),
-                      ),
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) {
+          // Any non-default freq/te, or the global De Bruijn toggle, routes
+          // through the custom command (hardcoded menus can't change freq/te).
+          final bool willUseCustom = canCustom &&
+              (_useDeBruijnMode ||
+                  selectedFreq != protocol.frequencyMhz ||
+                  selectedTe != protocol.te);
+          final String modeSuffix = willUseCustom ? ' (DeBruijn)' : '';
+          return AlertDialog(
+            title: Text(AppLocalizations.of(context)!.startBruteForceSuffix(modeSuffix)),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _infoRow(AppLocalizations.of(context)!.protocol, '${protocol.name}$modeSuffix'),
+                _infoRow(AppLocalizations.of(context)!.keySpace, '${protocol.bits}-bit ${protocol.encoding}'),
+                if (modeSuffix.isNotEmpty)
+                  _infoRow(AppLocalizations.of(context)!.modeLabel, AppLocalizations.of(context)!.deBruijnFaster),
+                _infoRow(AppLocalizations.of(context)!.delay, '$delayMs ms'),
+                _infoRow(AppLocalizations.of(context)!.estTime, estTime),
+                const SizedBox(height: 12),
+
+                // --- Frequency picker (region/variant protocols) ---
+                if (protocol.freqOptions != null && protocol.freqOptions!.length > 1) ...[
+                  Text('Frequency',
+                      style: TextStyle(color: AppColors.secondaryText, fontSize: 12)),
+                  const SizedBox(height: 4),
+                  DropdownButton<double>(
+                    value: selectedFreq,
+                    isExpanded: true,
+                    dropdownColor: AppColors.secondaryBackground,
+                    items: protocol.freqOptions!
+                        .map((f) => DropdownMenuItem<double>(
+                              value: f,
+                              child: Text(
+                                '${freqLabel(f)}${f == protocol.frequencyMhz ? '  (default)' : ''}',
+                                style: const TextStyle(color: AppColors.primaryText),
+                              ),
+                            ))
+                        .toList(),
+                    onChanged: (v) {
+                      if (v != null) setDialogState(() => selectedFreq = v);
+                    },
+                  ),
+                  const SizedBox(height: 8),
+                ] else
+                  _infoRow(AppLocalizations.of(context)!.frequency, freqLabel(selectedFreq)),
+
+                // --- Timing (te) override / manual sweep ---
+                if (canCustom) ...[
+                  Text('Timing te (µs) — try several if it doesn\'t trigger',
+                      style: TextStyle(color: AppColors.secondaryText, fontSize: 12)),
+                  const SizedBox(height: 4),
+                  DropdownButton<int>(
+                    value: selectedTe,
+                    isExpanded: true,
+                    dropdownColor: AppColors.secondaryBackground,
+                    items: teOptions
+                        .map((t) => DropdownMenuItem<int>(
+                              value: t,
+                              child: Text(
+                                '$t µs${t == protocol.te ? '  (default)' : ''}',
+                                style: const TextStyle(color: AppColors.primaryText),
+                              ),
+                            ))
+                        .toList(),
+                    onChanged: (v) {
+                      if (v != null) setDialogState(() => selectedTe = v);
+                    },
+                  ),
+                  const SizedBox(height: 8),
+                ],
+
+                if (protocol.bits >= 24)
+                  Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: AppColors.warning.withValues(alpha: 0.1),
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(color: AppColors.warning.withValues(alpha: 0.3)),
                     ),
-                  ],
+                    child: Row(
+                      children: [
+                        Icon(Icons.warning_amber, color: AppColors.warning, size: 18),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            AppLocalizations.of(context)!.largeKeyspaceWarning(protocol.bits, estTime),
+                            style: TextStyle(color: AppColors.warning, fontSize: 12),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                const SizedBox(height: 8),
+                Text(
+                  AppLocalizations.of(context)!.deviceWillTransmit,
+                  style: TextStyle(color: AppColors.secondaryText, fontSize: 12),
                 ),
-              ),
-            const SizedBox(height: 8),
-            Text(
-              AppLocalizations.of(context)!.deviceWillTransmit,
-              style: TextStyle(color: AppColors.secondaryText, fontSize: 12),
+              ],
             ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(false),
-            child: Text(AppLocalizations.of(context)!.cancel),
-          ),
-          ElevatedButton.icon(
-            onPressed: () => Navigator.of(ctx).pop(true),
-            icon: const Icon(Icons.play_arrow, size: 18),
-            label: Text(AppLocalizations.of(context)!.start),
-          ),
-        ],
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(false),
+                child: Text(AppLocalizations.of(context)!.cancel),
+              ),
+              ElevatedButton.icon(
+                onPressed: () => Navigator.of(ctx).pop(true),
+                icon: const Icon(Icons.play_arrow, size: 18),
+                label: Text(AppLocalizations.of(context)!.start),
+              ),
+            ],
+          );
+        },
       ),
     );
 
     if (confirmed != true || !context.mounted) return;
 
+    // Recompute routing from the final selection.
+    final bool useCustomDeBruijn = canCustom &&
+        (_useDeBruijnMode ||
+            selectedFreq != protocol.frequencyMhz ||
+            selectedTe != protocol.te);
+    final String modeSuffix = useCustomDeBruijn ? ' (DeBruijn)' : '';
+
     try {
       if (useCustomDeBruijn) {
-        // Send custom De Bruijn command with per-protocol timing and frequency
+        // Custom De Bruijn honors the chosen region frequency and te.
         await bleProvider.sendCustomDeBruijnCommand(
           bits: protocol.bits,
-          te: protocol.te,
+          te: selectedTe,
           ratio: protocol.ratio,
-          frequencyMhz: protocol.frequencyMhz,
+          frequencyMhz: selectedFreq,
         );
       } else {
-        await bleProvider.sendBruterCommand(actualMenuId);
+        await bleProvider.sendBruterCommand(protocol.menuId);
       }
 
       if (context.mounted) {
