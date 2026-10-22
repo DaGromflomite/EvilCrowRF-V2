@@ -3349,7 +3349,17 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
   List<SubFileEntry> _allFiles = [];
   Map<String, int> _categoryCounts = {};
   Set<String> _selectedCategories = {};
-  bool _excludeBruteForce = true;
+  // Brute-force folders are huge pre-made signal dumps (not needed for the
+  // firmware's own De Bruijn brute-forcer). Off by default, but available.
+  bool _includeBruteForce = false;
+  // Optional, destructive: wipe the SD card (delete all + recreate default
+  // folders) before uploading. Off by default, confirmed on the intro screen.
+  bool _formatFirst = false;
+
+  // Soft limit for a single BLE upload session. Each file takes ~0.4 s over
+  // BLE, so beyond this it runs into many minutes/hours and risks timeouts.
+  // Not a hard block — just a warning so the user can split across sessions.
+  static const int _recommendedMaxFiles = 1500;
 
   @override
   void initState() {
@@ -3357,26 +3367,46 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
     _checkForResumableSession();
   }
 
-  /// On open, check if a previous session can be resumed.
+  /// On open, check if a previous session can be resumed, then show the intro
+  /// screen (which explains the process and offers a format-first option).
   Future<void> _checkForResumableSession() async {
     final hasResume = await FlipperSubDbService.hasResumableSession();
     if (!mounted) return;
-    if (hasResume) {
-      final completed = await FlipperSubDbService.loadCompletedFiles();
+    Set<String> completed = {};
+    if (hasResume) completed = await FlipperSubDbService.loadCompletedFiles();
+    if (!mounted) return;
+    setState(() {
+      _checkingResume = false;
+      _hasResumableSession = hasResume;
+      _completedPaths = hasResume ? completed : {};
+      // Show the explainer first; nothing downloads until the user chooses.
+      _phase = 'intro';
+    });
+  }
+
+  /// Called from the intro screen's Start / Resume buttons. Optionally wipes
+  /// the SD card first, then kicks off the download/clone flow.
+  Future<void> _onIntroStart({required bool resume}) async {
+    bool effectiveResume = resume;
+    if (_formatFirst) {
+      // A wipe invalidates any previous session, so force a fresh start.
+      effectiveResume = false;
+      _completedPaths = {};
       setState(() {
-        _checkingResume = false;
-        _hasResumableSession = true;
-        _completedPaths = completed;
-        _statusText =
-            'Previous session found (${completed.length} files already uploaded). Resume or start fresh?';
+        _phase = 'format';
+        _statusText = 'Formatting SD card (erasing and recreating folders)...';
+        _progress = 0.0;
       });
-    } else {
-      setState(() {
-        _checkingResume = false;
-        _hasResumableSession = false;
-      });
-      _startCloning(resume: false);
+      try {
+        await widget.bleProvider.formatSDCard();
+        // Give the firmware a moment to delete + recreate the default folders.
+        await Future.delayed(const Duration(seconds: 3));
+      } catch (_) {
+        // If formatting fails we still proceed; upload will create folders.
+      }
+      if (!mounted) return;
     }
+    _startCloning(resume: effectiveResume);
   }
 
   /// Pause the current upload. Finishes the file in progress, then stops.
@@ -3515,7 +3545,7 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
   int get _selectedFileCount => FlipperSubDbService.filterSelection(
         _allFiles,
         categories: _selectedCategories,
-        excludeBruteForce: _excludeBruteForce,
+        excludeBruteForce: !_includeBruteForce,
       ).length;
 
   /// Confirm the category selection and start uploading the chosen files.
@@ -3523,7 +3553,7 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
     final selected = FlipperSubDbService.filterSelection(
       _allFiles,
       categories: _selectedCategories,
-      excludeBruteForce: _excludeBruteForce,
+      excludeBruteForce: !_includeBruteForce,
     );
     if (selected.isEmpty) return;
     _beginUpload(selected);
@@ -3670,8 +3700,125 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
     }
   }
 
+  Widget _introStep(String n, String text) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 18,
+            child: Text(n,
+                style: TextStyle(
+                    color: AppColors.primaryAccent,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600)),
+          ),
+          Expanded(
+            child: Text(text,
+                style:
+                    TextStyle(color: AppColors.secondaryText, fontSize: 12)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Explainer shown before anything downloads: describes the 3-step flow,
+  /// offers the optional (destructive) format-first option, and handles resume.
+  Widget _buildIntroDialog(BuildContext context) {
+    return AlertDialog(
+      title: Row(
+        children: [
+          const Icon(Icons.cloud_download, color: Colors.orange),
+          const SizedBox(width: 8),
+          const Expanded(
+            child:
+                Text('Clone SubGHz Database', style: TextStyle(fontSize: 16)),
+          ),
+        ],
+      ),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('How this works:',
+                style: TextStyle(
+                    fontWeight: FontWeight.w600,
+                    color: AppColors.primaryText,
+                    fontSize: 13)),
+            const SizedBox(height: 6),
+            _introStep('1.',
+                'The SubGHz database is downloaded to your phone\'s storage (a one-time download of a few tens of MB).'),
+            _introStep('2.',
+                'You choose which sections to send to the Crow\'s SD card.'),
+            _introStep('3.',
+                'The selected files transfer over Bluetooth, which is slow — keep each batch small (recommended under $_recommendedMaxFiles files). You can run more batches afterward.'),
+            const SizedBox(height: 10),
+            if (_hasResumableSession) ...[
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.orange.withOpacity(0.12),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text(
+                  'A previous session was found (${_completedPaths.length} files already uploaded). '
+                  'You can resume it or start fresh.',
+                  style: const TextStyle(color: Colors.orange, fontSize: 11),
+                ),
+              ),
+              const SizedBox(height: 8),
+            ],
+            CheckboxListTile(
+              contentPadding: EdgeInsets.zero,
+              dense: true,
+              controlAffinity: ListTileControlAffinity.leading,
+              activeColor: AppColors.error,
+              value: _formatFirst,
+              title: const Text('Format SD card first',
+                  style: TextStyle(fontSize: 13)),
+              subtitle: Text(
+                'Erases EVERYTHING on the card (including your recordings) and '
+                'recreates empty folders. Forces a fresh start.',
+                style: TextStyle(color: AppColors.error, fontSize: 11),
+              ),
+              onChanged: (v) => setState(() => _formatFirst = v ?? false),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        if (_hasResumableSession && !_formatFirst)
+          OutlinedButton(
+            onPressed: () {
+              setState(() {
+                _hasResumableSession = false;
+                _completedPaths = {};
+              });
+              _onIntroStart(resume: false);
+            },
+            child: const Text('Start fresh'),
+          ),
+        ElevatedButton.icon(
+          onPressed: () =>
+              _onIntroStart(resume: _hasResumableSession && !_formatFirst),
+          icon: const Icon(Icons.play_arrow, size: 18),
+          label: Text(
+              (_hasResumableSession && !_formatFirst) ? 'Resume' : 'Start'),
+          style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
+        ),
+      ],
+    );
+  }
+
   /// Dialog that lets the user pick which top-level sections of the SubGHz DB
-  /// to upload, with a switch to skip the oversized brute-force folders.
+  /// to upload, with a switch to include or skip the brute-force folders.
   Widget _buildSelectionDialog(BuildContext context) {
     final selectedCount = _selectedFileCount;
     final totalCount = _allFiles.length;
@@ -3702,14 +3849,15 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
               contentPadding: EdgeInsets.zero,
               dense: true,
               activeColor: Colors.orange,
-              title: const Text('Skip brute-force folders',
+              title: const Text('Include brute-force folders',
                   style: TextStyle(fontSize: 13)),
               subtitle: Text(
-                'Recommended — removes huge code enumerations',
+                'Large pre-made code dumps — off by default (not needed for the '
+                'device\'s own brute-forcer). Turn on to transfer them too.',
                 style: TextStyle(color: AppColors.secondaryText, fontSize: 11),
               ),
-              value: _excludeBruteForce,
-              onChanged: (v) => setState(() => _excludeBruteForce = v),
+              value: _includeBruteForce,
+              onChanged: (v) => setState(() => _includeBruteForce = v),
             ),
             Row(
               children: [
@@ -3766,6 +3914,34 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
                 fontSize: 12,
               ),
             ),
+            // Warn when the selection is large enough to be slow / timeout-prone.
+            if (selectedCount > _recommendedMaxFiles) ...[
+              const SizedBox(height: 6),
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.orange.withOpacity(0.12),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Icon(Icons.warning_amber_rounded,
+                        color: Colors.orange, size: 16),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        'Large selection: ~${(selectedCount * 0.4 / 60).ceil()} min over BLE '
+                        'and more likely to hit timeouts. Consider fewer sections '
+                        '(under $_recommendedMaxFiles) or splitting across sessions.',
+                        style: const TextStyle(
+                            color: Colors.orange, fontSize: 11),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
           ],
         ),
       ),
@@ -3804,44 +3980,10 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
       );
     }
 
-    // If a resumable session was found, show Resume / Start Fresh options
-    if (_hasResumableSession && !_isPaused && _phase == 'init') {
-      return AlertDialog(
-        title: Row(
-          children: [
-            Icon(Icons.replay, color: Colors.orange),
-            const SizedBox(width: 8),
-            const Expanded(
-              child: Text('Resume Clone?', style: TextStyle(fontSize: 16)),
-            ),
-          ],
-        ),
-        content: Text(
-          '${_completedPaths.length} files were uploaded in a previous session.\n'
-          'Resume where you left off, or start fresh?',
-          style: TextStyle(color: AppColors.primaryText, fontSize: 13),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('Cancel'),
-          ),
-          OutlinedButton(
-            onPressed: () {
-              setState(() {
-                _hasResumableSession = false;
-                _completedPaths = {};
-              });
-              _startCloning(resume: false);
-            },
-            child: const Text('Start Fresh'),
-          ),
-          ElevatedButton(
-            onPressed: _resumeCloning,
-            child: const Text('Resume'),
-          ),
-        ],
-      );
+    // Intro / explainer — shown first. Explains the process, offers the
+    // optional format-first choice, and handles resume when applicable.
+    if (_phase == 'intro') {
+      return _buildIntroDialog(context);
     }
 
     // Category picker: shown after extraction, before uploading.
@@ -3895,11 +4037,13 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
                 ),
                 const SizedBox(width: 8),
                 Text(
-                  _phase == 'download'
-                      ? 'Phase 1/3: Downloading'
-                      : _phase == 'extract'
-                          ? 'Phase 2/3: Extracting'
-                          : 'Phase 3/3: Uploading to SDCard',
+                  _phase == 'format'
+                      ? 'Preparing: Formatting SD card'
+                      : _phase == 'download'
+                          ? 'Phase 1/3: Downloading'
+                          : _phase == 'extract'
+                              ? 'Phase 2/3: Extracting'
+                              : 'Phase 3/3: Uploading to SDCard',
                   style: TextStyle(
                     color: AppColors.primaryAccent,
                     fontWeight: FontWeight.w600,
