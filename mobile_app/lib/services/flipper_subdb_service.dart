@@ -83,6 +83,97 @@ class FlipperSubDbService {
     }).toList();
   }
 
+  // ---------------------------------------------------------------------------
+  // Large-file splitting — big RAW .sub sweeps (brute-force dumps can be
+  // megabytes = thousands of unacked BLE packets) time out on upload. Split
+  // them into smaller, fully valid .sub pieces so each transfers reliably and
+  // can be retried cheaply. The firmware transmits by file CONTENT (header +
+  // RAW_Data), not by filename, and the split is line-aligned and lossless, so
+  // every piece plays identically to the original and the pieces in sequence
+  // reproduce the full sweep.
+  // ---------------------------------------------------------------------------
+
+  /// A RAW .sub larger than this (bytes) is split into pieces for upload.
+  static const int splitThresholdBytes = 200 * 1024;
+
+  /// Target size (bytes) per split piece — small enough to be a few hundred
+  /// BLE chunks (reliable to send, cheap to retry).
+  static const int splitPieceTargetBytes = 128 * 1024;
+
+  /// Split a large RAW .sub [entry] into multiple smaller, fully valid .sub
+  /// pieces named "<base>_01.sub", "<base>_02.sub", ... Each piece repeats the
+  /// original header and carries a whole-line subset of the RAW_Data, so the
+  /// pulse timings are preserved exactly. Returns the entry unchanged when it
+  /// is small, not RAW, or cannot be usefully split.
+  static List<SubFileEntry> splitIfLargeRaw(SubFileEntry entry) {
+    if (entry.content.length <= splitThresholdBytes) return [entry];
+
+    // 1 byte -> 1 char so the text round-trips exactly (.sub is ASCII).
+    final lines = String.fromCharCodes(entry.content).split('\n');
+
+    // Header = everything before the first RAW_Data line.
+    final headerLines = <String>[];
+    int firstRaw = -1;
+    for (int i = 0; i < lines.length; i++) {
+      if (lines[i].startsWith('RAW_Data:')) {
+        firstRaw = i;
+        break;
+      }
+      headerLines.add(lines[i]);
+    }
+    final isRaw = headerLines.any(
+        (l) => l.replaceAll(' ', '').toUpperCase().startsWith('PROTOCOL:RAW'));
+    if (firstRaw < 0 || !isRaw) return [entry];
+
+    final rawLines =
+        lines.sublist(firstRaw).where((l) => l.startsWith('RAW_Data:')).toList();
+    if (rawLines.isEmpty) return [entry];
+
+    final header = headerLines.join('\n');
+    final int headerBytes = header.length + 1; // trailing newline
+
+    // Group whole RAW_Data lines until each piece approaches the target size.
+    final pieces = <List<String>>[];
+    var current = <String>[];
+    int currentBytes = headerBytes;
+    for (final line in rawLines) {
+      final lineBytes = line.length + 1;
+      if (current.isNotEmpty &&
+          currentBytes + lineBytes > splitPieceTargetBytes) {
+        pieces.add(current);
+        current = <String>[];
+        currentBytes = headerBytes;
+      }
+      current.add(line);
+      currentBytes += lineBytes;
+    }
+    if (current.isNotEmpty) pieces.add(current);
+    if (pieces.length <= 1) return [entry]; // splitting wouldn't help
+
+    final base = entry.relativePath.toLowerCase().endsWith('.sub')
+        ? entry.relativePath.substring(0, entry.relativePath.length - 4)
+        : entry.relativePath;
+    final out = <SubFileEntry>[];
+    for (int i = 0; i < pieces.length; i++) {
+      final nn = (i + 1).toString().padLeft(2, '0');
+      final body = '$header\n${pieces[i].join('\n')}\n';
+      out.add(SubFileEntry(
+        relativePath: '${base}_$nn.sub',
+        content: Uint8List.fromList(body.codeUnits),
+      ));
+    }
+    return out;
+  }
+
+  /// Expand an upload selection, splitting any oversized RAW .sub into pieces.
+  static List<SubFileEntry> expandForUpload(List<SubFileEntry> files) {
+    final out = <SubFileEntry>[];
+    for (final f in files) {
+      out.addAll(splitIfLargeRaw(f));
+    }
+    return out;
+  }
+
   /// Download the repository ZIP and extract all .sub files.
   ///
   /// Returns a list of [SubFileEntry] with relative paths and content.

@@ -3556,7 +3556,9 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
       excludeBruteForce: !_includeBruteForce,
     );
     if (selected.isEmpty) return;
-    _beginUpload(selected);
+    // Split any oversized RAW .sub into smaller, reliably-transferable pieces.
+    final expanded = FlipperSubDbService.expandForUpload(selected);
+    _beginUpload(expanded);
   }
 
   /// Upload the chosen [files] to the SD card. Runs after the user confirms
@@ -3913,6 +3915,12 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
                 fontWeight: FontWeight.w600,
                 fontSize: 12,
               ),
+            ),
+            const SizedBox(height: 2),
+            Text(
+              'Large files are auto-split into smaller .sub pieces for reliable '
+              'transfer (count may rise during upload).',
+              style: TextStyle(color: AppColors.secondaryText, fontSize: 10),
             ),
             // Warn when the selection is large enough to be slow / timeout-prone.
             if (selectedCount > _recommendedMaxFiles) ...[
