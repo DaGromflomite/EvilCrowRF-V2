@@ -25,6 +25,64 @@ class FlipperSubDbService {
   /// Target folder name on the device SDCard
   static const String sdTargetFolder = 'SUB Files';
 
+  /// Label used for files that sit directly at the DB root with no category
+  /// folder of their own.
+  static const String rootCategory = '(root)';
+
+  // ---------------------------------------------------------------------------
+  // Category selection — lets the user pull individual sections of the DB
+  // instead of the whole thing. The full repo is tens of thousands of tiny
+  // .sub files (brute-force dumps especially), which is far too much to push
+  // over BLE in one go; see upstream issue #16. Grouping by the top-level
+  // folder lets the UI offer a checklist, and the brute-force filter removes
+  // the pathologically large enumerations at any depth.
+  // ---------------------------------------------------------------------------
+
+  /// Top-level category of an entry (the first path segment), or
+  /// [rootCategory] when the file is not inside a subfolder.
+  static String categoryOf(String relativePath) {
+    final slash = relativePath.indexOf('/');
+    return slash > 0 ? relativePath.substring(0, slash) : rootCategory;
+  }
+
+  /// Group extracted entries by their top-level category folder, returning a
+  /// map of category name -> file count, ordered alphabetically (case-insensitive).
+  static Map<String, int> categoryCounts(List<SubFileEntry> files) {
+    final counts = <String, int>{};
+    for (final f in files) {
+      final category = categoryOf(f.relativePath);
+      counts[category] = (counts[category] ?? 0) + 1;
+    }
+    final entries = counts.entries.toList()
+      ..sort((a, b) => a.key.toLowerCase().compareTo(b.key.toLowerCase()));
+    return Map<String, int>.fromEntries(entries);
+  }
+
+  /// True if any segment of the path looks like a brute-force dump folder
+  /// (e.g. "CAME_brute_force"). These folders hold thousands of near-identical
+  /// files and are excluded by default.
+  static bool isBruteForcePath(String relativePath) {
+    for (final seg in relativePath.toLowerCase().split('/')) {
+      if (seg.contains('brute')) return true;
+    }
+    return false;
+  }
+
+  /// Filter the extracted entries down to the user's selection: only files
+  /// whose top-level category is in [categories], optionally dropping any
+  /// brute-force folders.
+  static List<SubFileEntry> filterSelection(
+    List<SubFileEntry> files, {
+    required Set<String> categories,
+    required bool excludeBruteForce,
+  }) {
+    return files.where((f) {
+      if (!categories.contains(categoryOf(f.relativePath))) return false;
+      if (excludeBruteForce && isBruteForcePath(f.relativePath)) return false;
+      return true;
+    }).toList();
+  }
+
   /// Download the repository ZIP and extract all .sub files.
   ///
   /// Returns a list of [SubFileEntry] with relative paths and content.

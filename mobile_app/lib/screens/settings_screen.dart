@@ -3344,6 +3344,13 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
   bool _hasResumableSession = false;
   Set<String> _completedPaths = {};
 
+  // Category selection state — lets the user pick which sections of the DB to
+  // push instead of the whole repo (upstream issue #16).
+  List<SubFileEntry> _allFiles = [];
+  Map<String, int> _categoryCounts = {};
+  Set<String> _selectedCategories = {};
+  bool _excludeBruteForce = true;
+
   @override
   void initState() {
     super.initState();
@@ -3468,14 +3475,75 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
         return;
       }
 
-      _totalFiles = subFiles.length;
+      // Extraction done. Instead of pushing the whole database over BLE
+      // (impractical — tens of thousands of files, see issue #16), let the
+      // user pick which top-level sections to upload. Stash the full list and
+      // switch to the selection phase; the actual upload runs in _beginUpload
+      // once the user confirms.
+      _allFiles = subFiles;
+      _categoryCounts = FlipperSubDbService.categoryCounts(subFiles);
+      _selectedCategories = _categoryCounts.keys.toSet();
+      // Don't hold the wakelock while waiting for the user to choose.
+      WakelockPlus.disable();
+      if (mounted) {
+        setState(() {
+          _phase = 'select';
+          _statusText = 'Choose which sections to upload.';
+          _progress = 0.0;
+        });
+      }
+      return;
+    } catch (e) {
+      // On error, save progress so user can resume later
+      if (_completedPaths.isNotEmpty) {
+        await FlipperSubDbService.saveProgress(_completedPaths);
+      }
+      // Release wakelock on error
+      WakelockPlus.disable();
+      if (mounted) {
+        setState(() {
+          _isDone = true;
+          _hasError = true;
+          _errorMessage = e.toString();
+          _statusText = 'Error: $e';
+        });
+      }
+    }
+  }
+
+  /// Number of files that the current category selection would upload.
+  int get _selectedFileCount => FlipperSubDbService.filterSelection(
+        _allFiles,
+        categories: _selectedCategories,
+        excludeBruteForce: _excludeBruteForce,
+      ).length;
+
+  /// Confirm the category selection and start uploading the chosen files.
+  void _confirmSelection() {
+    final selected = FlipperSubDbService.filterSelection(
+      _allFiles,
+      categories: _selectedCategories,
+      excludeBruteForce: _excludeBruteForce,
+    );
+    if (selected.isEmpty) return;
+    _beginUpload(selected);
+  }
+
+  /// Upload the chosen [files] to the SD card. Runs after the user confirms
+  /// their selection; mirrors the original single-shot upload but over a
+  /// filtered list so only the picked sections are pushed.
+  Future<void> _beginUpload(List<SubFileEntry> files) async {
+    // Keep the screen awake for the whole upload.
+    WakelockPlus.enable();
+    try {
+      _totalFiles = files.length;
       _uploadedFiles = _completedPaths.length;
 
       // Phase 3: Create base directory on SDCard
       setState(() {
         _phase = 'upload';
         _statusText = 'Creating "SUB Files" folder on SDCard...';
-        _progress = _completedPaths.length / _totalFiles;
+        _progress = _totalFiles > 0 ? _completedPaths.length / _totalFiles : 0.0;
       });
 
       await widget.bleProvider.createDirectory(
@@ -3484,7 +3552,7 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
 
       // Collect all unique subdirectories and create them
       final subdirs = <String>{};
-      for (final file in subFiles) {
+      for (final file in files) {
         final parts = file.relativePath.split('/');
         if (parts.length > 1) {
           // Build cumulative subdir paths
@@ -3512,7 +3580,7 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
       }
 
       // Phase 4: Upload files one at a time
-      for (int i = 0; i < subFiles.length; i++) {
+      for (int i = 0; i < files.length; i++) {
         // ── Check for pause after each file ──
         if (_pauseRequested) {
           await FlipperSubDbService.saveProgress(_completedPaths);
@@ -3528,7 +3596,7 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
           return;
         }
 
-        final file = subFiles[i];
+        final file = files[i];
 
         // Skip already-uploaded files (from a previous session)
         if (_completedPaths.contains(file.relativePath)) {
@@ -3542,7 +3610,7 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
           setState(() {
             _statusText =
                 'Uploading (${_uploadedFiles + 1}/$_totalFiles): ${file.relativePath}';
-            _progress = _uploadedFiles / _totalFiles;
+            _progress = _totalFiles > 0 ? _uploadedFiles / _totalFiles : 0.0;
           });
         }
 
@@ -3569,7 +3637,7 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
         }
       }
 
-      // All files processed – clean up cache
+      // All selected files processed – clean up cache
       await FlipperSubDbService.clearCache();
 
       if (mounted) {
@@ -3600,6 +3668,120 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
         });
       }
     }
+  }
+
+  /// Dialog that lets the user pick which top-level sections of the SubGHz DB
+  /// to upload, with a switch to skip the oversized brute-force folders.
+  Widget _buildSelectionDialog(BuildContext context) {
+    final selectedCount = _selectedFileCount;
+    final totalCount = _allFiles.length;
+    final categories = _categoryCounts.keys.toList();
+    return AlertDialog(
+      title: Row(
+        children: [
+          const Icon(Icons.checklist, color: Colors.orange),
+          const SizedBox(width: 8),
+          const Expanded(
+            child: Text('Choose Sections', style: TextStyle(fontSize: 16)),
+          ),
+        ],
+      ),
+      content: SizedBox(
+        width: double.maxFinite,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'The full database is too large to push over BLE in one go. '
+              'Pick only the sections you want.',
+              style: TextStyle(color: AppColors.secondaryText, fontSize: 12),
+            ),
+            const SizedBox(height: 4),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              dense: true,
+              activeColor: Colors.orange,
+              title: const Text('Skip brute-force folders',
+                  style: TextStyle(fontSize: 13)),
+              subtitle: Text(
+                'Recommended — removes huge code enumerations',
+                style: TextStyle(color: AppColors.secondaryText, fontSize: 11),
+              ),
+              value: _excludeBruteForce,
+              onChanged: (v) => setState(() => _excludeBruteForce = v),
+            ),
+            Row(
+              children: [
+                TextButton(
+                  onPressed: () => setState(() =>
+                      _selectedCategories = _categoryCounts.keys.toSet()),
+                  child: const Text('Select all'),
+                ),
+                TextButton(
+                  onPressed: () =>
+                      setState(() => _selectedCategories = <String>{}),
+                  child: const Text('Clear'),
+                ),
+              ],
+            ),
+            const Divider(height: 1),
+            Flexible(
+              child: ListView.builder(
+                shrinkWrap: true,
+                itemCount: categories.length,
+                itemBuilder: (ctx, i) {
+                  final cat = categories[i];
+                  final count = _categoryCounts[cat] ?? 0;
+                  return CheckboxListTile(
+                    contentPadding: EdgeInsets.zero,
+                    dense: true,
+                    controlAffinity: ListTileControlAffinity.leading,
+                    activeColor: Colors.orange,
+                    value: _selectedCategories.contains(cat),
+                    title: Text(cat, style: const TextStyle(fontSize: 13)),
+                    secondary: Text(
+                      '$count',
+                      style: TextStyle(
+                          color: AppColors.secondaryText, fontSize: 11),
+                    ),
+                    onChanged: (v) => setState(() {
+                      if (v == true) {
+                        _selectedCategories.add(cat);
+                      } else {
+                        _selectedCategories.remove(cat);
+                      }
+                    }),
+                  );
+                },
+              ),
+            ),
+            const Divider(height: 1),
+            const SizedBox(height: 8),
+            Text(
+              'Will upload $selectedCount of $totalCount files',
+              style: TextStyle(
+                color: AppColors.primaryAccent,
+                fontWeight: FontWeight.w600,
+                fontSize: 12,
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        ElevatedButton.icon(
+          onPressed: selectedCount > 0 ? _confirmSelection : null,
+          icon: const Icon(Icons.cloud_upload, size: 18),
+          label: Text('Upload ($selectedCount)'),
+          style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
+        ),
+      ],
+    );
   }
 
   @override
@@ -3660,6 +3842,11 @@ class _SubGhzCloneDialogState extends State<_SubGhzCloneDialog> {
           ),
         ],
       );
+    }
+
+    // Category picker: shown after extraction, before uploading.
+    if (_phase == 'select') {
+      return _buildSelectionDialog(context);
     }
 
     return AlertDialog(
