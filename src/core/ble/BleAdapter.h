@@ -47,6 +47,9 @@ private:
     public:
         ServerCallbacks(BleAdapter* adapter) : adapter(adapter) {}
         void onConnect(NimBLEServer* pServer) override;
+        // Overload with connection descriptor — used to negotiate stable
+        // connection parameters right after connect (BLE stability fix).
+        void onConnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) override;
         void onDisconnect(NimBLEServer* pServer) override;
     };
     
@@ -117,6 +120,17 @@ private:
     
     // Mutex protecting static buffer in sendSingleChunk (cross-core safety)
     static SemaphoreHandle_t sendChunkMutex;
+
+    // --- BLE stability fix: offload inbound command processing off the NimBLE host task ---
+    // Heavy commands (SD/FATFS/SPI/CC1101) executed synchronously inside the onWrite
+    // callback block the NimBLE host task, which then misses connection events and the
+    // link drops with CONNECTION_TIMEOUT on Android. Instead we copy each inbound payload
+    // onto a queue and process it on a dedicated worker task pinned to Core 1, leaving the
+    // BLE stack on Core 0 free to service the connection.
+    struct InboundMsg { uint8_t* data; uint16_t len; };
+    static QueueHandle_t inboundQueue;
+    static TaskHandle_t  inboundTaskHandle;
+    static void inboundTask(void* arg);
 };
 
 #endif // BleAdapter_h

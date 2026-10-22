@@ -19,6 +19,8 @@ const char* BleAdapter::CHARACTERISTIC_UUID_RX = "6e400002-b5a3-f393-e0a9-e50e24
 
 BleAdapter* BleAdapter::instance = nullptr;
 SemaphoreHandle_t BleAdapter::sendChunkMutex = nullptr;
+QueueHandle_t BleAdapter::inboundQueue = nullptr;
+TaskHandle_t BleAdapter::inboundTaskHandle = nullptr;
 
 BleAdapter::BleAdapter() : pServer(nullptr), pService(nullptr), pTxCharacteristic(nullptr), pRxCharacteristic(nullptr), serverCallbacks(nullptr), characteristicCallbacks(nullptr) {
     instance = this;
@@ -94,7 +96,19 @@ void BleAdapter::begin() {
     // Start the service
     pService->start();
     ESP_LOGD(TAG, "NimBLE service started");
-    
+
+    // BLE stability fix: start the dedicated inbound command processor BEFORE advertising,
+    // so no incoming write is ever handled on the NimBLE host task.
+    if (inboundQueue == nullptr) {
+        inboundQueue = xQueueCreate(16, sizeof(InboundMsg));
+    }
+    if (inboundQueue != nullptr && inboundTaskHandle == nullptr) {
+        // 8KB stack: processBinaryData can run SD/FATFS/SPI work. Pinned to Core 1 so it
+        // never competes with the BLE stack on Core 0.
+        xTaskCreatePinnedToCore(inboundTask, "BleInbound", 8192, this, 1, &inboundTaskHandle, 1);
+        ESP_LOGI(TAG, "BLE inbound processor task started (Core 1)");
+    }
+
     // Start advertising
     NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
     pAdvertising->addServiceUUID(SERVICE_UUID);
@@ -746,10 +760,35 @@ bool BleAdapter::handleUploadChunk(uint8_t chunkId, uint8_t chunkNum, uint8_t to
     }
 }
 
+// Dedicated inbound command processor — keeps heavy command work (SD/SPI/CC1101) off the
+// NimBLE host task so the BLE link is never starved. See InboundMsg/onWrite (stability fix).
+void BleAdapter::inboundTask(void* arg) {
+    BleAdapter* self = static_cast<BleAdapter*>(arg);
+    InboundMsg msg;
+    for (;;) {
+        if (xQueueReceive(inboundQueue, &msg, portMAX_DELAY) == pdTRUE) {
+            if (msg.data != nullptr) {
+                self->processBinaryData(msg.data, msg.len);
+                free(msg.data);
+            }
+        }
+    }
+}
+
 // Server callbacks implementation
 void BleAdapter::ServerCallbacks::onConnect(NimBLEServer* pServer) {
     instance->deviceConnected = true;
     ESP_LOGI(TAG, "BLE Client connected");
+}
+
+// BLE stability fix: negotiate stable connection parameters immediately on connect.
+// Without this, the link uses whatever the central proposes and can renegotiate into
+// parameters that drop with CONNECTION_TIMEOUT on Android. Values: connection interval
+// 30-50 ms (24-40 * 1.25 ms), slave latency 0, supervision timeout 6 s (600 * 10 ms).
+void BleAdapter::ServerCallbacks::onConnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) {
+    instance->deviceConnected = true;
+    pServer->updateConnParams(desc->conn_handle, 24, 40, 0, 600);
+    ESP_LOGI(TAG, "BLE conn params requested: interval 30-50ms, latency 0, supervision 6s");
 }
 
 void BleAdapter::ServerCallbacks::onDisconnect(NimBLEServer* pServer) {
@@ -780,8 +819,25 @@ void BleAdapter::CharacteristicCallbacks::onWrite(NimBLECharacteristic* pCharact
             ESP_LOGI(TAG, "BLE payload preview (%u bytes): %s", static_cast<unsigned>(len), hexPreview);
         }
 
-        // processBinaryData expects a mutable pointer; copy to local buffer
-        // since NimBLEAttValue data is const
-        adapter->processBinaryData(const_cast<uint8_t*>(val.data()), len);
+        // BLE stability fix: do NOT process on the NimBLE host task. Blocking SD/SPI/CC1101
+        // work here stalls the stack, the link misses connection events and Android drops it
+        // with CONNECTION_TIMEOUT. Copy the payload and hand it to the inbound worker task.
+        if (BleAdapter::inboundQueue != nullptr) {
+            uint8_t* buf = (uint8_t*)malloc(len);
+            if (buf != nullptr) {
+                memcpy(buf, val.data(), len);
+                BleAdapter::InboundMsg msg{ buf, (uint16_t)len };
+                if (xQueueSend(BleAdapter::inboundQueue, &msg, 0) != pdTRUE) {
+                    // Queue full: drop rather than block the host task (keeps the link alive)
+                    free(buf);
+                    ESP_LOGW(TAG, "Inbound queue full, dropping %u bytes", static_cast<unsigned>(len));
+                }
+            } else {
+                ESP_LOGE(TAG, "malloc failed for inbound %u bytes", static_cast<unsigned>(len));
+            }
+        } else {
+            // Fallback (pre-init): process inline
+            adapter->processBinaryData(const_cast<uint8_t*>(val.data()), len);
+        }
     }
 }
